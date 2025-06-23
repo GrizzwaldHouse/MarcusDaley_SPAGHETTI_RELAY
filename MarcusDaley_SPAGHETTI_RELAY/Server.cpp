@@ -1,5 +1,6 @@
 #include "Server.h"
 #include <cstring>
+#include <algorithm>
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 Server::Server() : listenSocket(INVALID_SOCKET),  serverRunning(false), serverPort(DEFAULT_PORT), maxClients(DEFAULT_CAPACITY),commandChar(DEFAULT_COMMAND_CHAR)
 {
@@ -256,6 +257,9 @@ int Server::HandleNewConnection()
 	{
 		//Add new client to tracking structures
 		clientSockets.push_back(newClientSocket);
+		ClientSession newSession;
+		newSession.joinTime = GetCurrentTimestamp();
+		clientSessions[newClientSocket] = newSession;
 		FD_SET(newClientSocket, &masterSet);
 		//Get client IP address for logging 
 		char clientIP[INET_ADDRSTRLEN];
@@ -271,59 +275,38 @@ int Server::HandleNewConnection()
 	return result;
 }
 
-int Server::HandleClientMessage(SOCKET clientSocket)
-{
-	int result = SUCCESS;
-	char buffer[BUFFER_SIZE];
-	//Receive framed message from client 
-	int receivedResult = RecieveFramedMessage(clientSocket, buffer, BUFFER_SIZE);
-	if (receivedResult != SUCCESS)
+
+	int Server::HandleClientMessage(SOCKET clientSocket)
 	{
-		if(receivedResult==SHUTDOWN|| receivedResult==DISCONNECT) {
-			LogMessage("Client disconnected - Socket: " + std::to_string(clientSocket));
-			
+		char buffer[BUFFER_SIZE];
+		std::cout << "[MESSAGE-PIPELINE] Processing incoming message [Socket:" << clientSocket << "]" << std::endl;
+
+		int receivedResult = RecieveFramedMessage(clientSocket, buffer, BUFFER_SIZE);
+
+		// Error handling with switch for clean control flow
+		switch (receivedResult) {
+		case SUCCESS:
+			break; // Continue processing
+
+		case SHUTDOWN:
+		case DISCONNECT:
+			std::cout << "[MESSAGE-INFO] Client disconnected gracefully [Socket:" << clientSocket << "]" << std::endl;
+			return receivedResult;
+
+		default:
+			std::cout << "[MESSAGE-ERROR] Failed to receive message [Socket:" << clientSocket
+				<< "] [Error:" << receivedResult << "]" << std::endl;
+			return receivedResult;
 		}
-		else
-		{
-			LogMessage("Failed to receive message from client - Error: " + std::to_string(receivedResult));
-			
-		}
-		result = receivedResult;
-	}
-	else 
-	{
+
 		std::string clientMessage(buffer);
-		//Check if message is a command
-		if (!clientMessage.empty() && clientMessage[0] == commandChar) {
-			result = ProcessCommand(clientSocket, clientMessage);
-		}
-		else 
-		{
-			//Handle regular chat message 
-			LogMessage("Chat message from client - Socket: " + std::to_string(clientSocket) + ", Message: " + clientMessage);
-			std::string senderName = "Anonymous"; // Default sender name
-			//Check if client is logged in and has a username
-			if (activeClients.find(clientSocket) != activeClients.end()) {
-				senderName = activeClients[clientSocket]; // Get username from active clients map
-			}
-			////If no user name is found deny and request login username
-			//else if (registeredClients.find(senderName) == registeredClients.end()) {
-			//	std::string errorMessage = "ERROR: You must register and login to send messages. Type '" + std::string(1, commandChar) + "help' for instructions.";
-			//	result = SendFramedMessage(clientSocket, errorMessage);
-			//	LogMessage("Client not registered - Requesting registration or login - Socket: " + std::to_string(clientSocket));
-			//}
-			else
-			{
-				//Broadcast message to all clients except the sender
-				std::string broadcastMessage = senderName + ": " + clientMessage;
-				result = BroadcastToAllClients(broadcastMessage, clientSocket);
-			}
-			
-			result = SUCCESS;
-		}
+		std::cout << "[MESSAGE-RECEIVED] Message type: " << (clientMessage[0] == commandChar ? "COMMAND" : "CHAT") << std::endl;
+
+		// Message routing with ternary operation
+		return (clientMessage[0] == commandChar)
+			? ProcessCommandMessage(clientSocket, clientMessage)
+			: ProcessChatMessage(clientSocket, clientMessage);
 	}
-	return result;
-}
 
 std::string Server::CreateMaskedPassword(const std::string& password)
 {
@@ -376,7 +359,7 @@ int Server::SendWelcomeMessage(SOCKET clientSocket)
 	welcomeMessage << "Commands start with '" << commandChar << "'\n";
 	welcomeMessage << "Type '" << commandChar << "help' for available commands.\n";
 	welcomeMessage << "Type '" << commandChar << "register <username> <password>' to register a new user.\n";
-	welcomeMessage << "Example: "<< commandChar<< "~register john mypassord\n";
+	welcomeMessage << "Example: "<< commandChar<< "register john mypassword\n";
 #if DEBUG_MODE
 	LogMessage("Sending welcome message to client - Socket: " + std::to_string(clientSocket));
 #endif // DEBUG_MODE
@@ -415,10 +398,59 @@ int Server::ProcessCommand(SOCKET clientSocket, const std::string& command)
 		std::string username, password;
 		iss >> username >> password;
 		if (username.empty() || password.empty()) {
-			LogMessage("Invalid register command - Missing username or password");
-			return PARAMETER_ERROR;
+			std::string errorMessage = "ERROR: Usage: " + std::string(1, commandChar) + "register <username> <password>";
+			result = SendFramedMessage(clientSocket, errorMessage);
 		}
-		result = HandleRegisterCommand(clientSocket, username, password);
+		else {
+			result = HandleRegisterCommand(clientSocket, username, password);
+		}
+	}
+	else if (cmd == "login")  
+	{
+		std::cout << "[COMMAND-DEBUG] Processing login command" << std::endl;
+		std::string username, password;
+		iss >> username >> password;
+		if (username.empty() || password.empty()) {
+			std::string errorMessage = "ERROR: Usage: " + std::string(1, commandChar) + "login <username> <password>";
+			result = SendFramedMessage(clientSocket, errorMessage);
+		}
+		else {
+			result = HandleLoginCommand(clientSocket, username, password);
+		}
+	}
+	else if (cmd == "logout")  
+	{
+		result = HandleLogoutCommand(clientSocket);
+	}
+	else if (cmd == "getlist")  
+	{
+		result = HandleGetListCommand(clientSocket);
+	}
+	else if (cmd == "getlog")  
+	{
+		result = HandleGetLogCommand(clientSocket);
+	}
+	else if (cmd == "send")  
+	{
+		std::string recipient;
+		iss >> recipient;
+
+		std::string message;
+		std::string word;
+		bool firstWord = true;
+		while (iss >> word) {
+			if (!firstWord) message += " ";
+			message += word;
+			firstWord = false;
+		}
+
+		if (recipient.empty() || message.empty()) {
+			std::string errorMessage = "ERROR: Usage: " + std::string(1, commandChar) + "send <username> <message>";
+			result = SendFramedMessage(clientSocket, errorMessage);
+		}
+		else {
+			result = HandleSendCommand(clientSocket, recipient, message);
+		}
 	}
 	else
 	{
@@ -437,9 +469,21 @@ int Server::HandleHelpCommand(SOCKET clientSocket)
 #endif // DEBUG_MODE
 	std::ostringstream helpMessage;
 	helpMessage << "Available commands:\n";
-	helpMessage << commandChar << "help - Show this help message\n";
-	helpMessage << commandChar << "register <username> <password> - Register a new user\n";
+	helpMessage << "Enter in the following " << commandChar << "help - Show this help message\n";
+	helpMessage << "Enter in the following using a space in between"<<commandChar << "register <username> <password> - Register a new user\n";
 	helpMessage << "More commands available after login";
+	helpMessage << commandChar << "login <username> <password> - Login to your account\n";
+
+	if (IsUserAuthenticated(clientSocket)) {
+		helpMessage << commandChar << "logout - Logout from your account\n";
+		helpMessage << commandChar << "getlist - Get list of active users\n";
+		helpMessage << commandChar << "getlog - Get public message history\n";
+		helpMessage << commandChar << "send <username> <message> - Send private message\n";
+		helpMessage << "Regular messages are broadcast to all users\n";
+	}
+	else {
+		helpMessage << "Login required for additional commands\n";
+	}
 	result = SendFramedMessage(clientSocket, helpMessage.str());
 	return result;
 }
@@ -450,11 +494,19 @@ int Server::HandleRegisterCommand(SOCKET clientSocket, const std::string& userna
 #if DEBUG_MODE
 	LogMessage("Handling register command for client - Socket: " + std::to_string(clientSocket) + ", Username: " + username);
 #endif // DEBUG_MODE
+	
 	//Validate input parameters
 	if(username.empty() || password.empty()) {
 		std::string errorMessage = "ERROR: Usage:" + std::string(1, commandChar) + "register <username> <password>";
 		result = SendFramedMessage(clientSocket, errorMessage);
 	}
+	//Check if client is already logged in
+	if (IsUserAuthenticated(clientSocket)) {
+		std::string errorMessage = "ERROR: You must logout before registering a new account.";
+		result = SendFramedMessage(clientSocket, errorMessage);
+		return result;
+	}
+
 	else if (IsUserRegistered(username)) 
 	{
 	std::string errorMessage = "ERROR: User '" + username + "' is already registered. Please chooose a different username";
@@ -469,21 +521,321 @@ int Server::HandleRegisterCommand(SOCKET clientSocket, const std::string& userna
 	{
 		//Create new user and add to registered clients
 		UserAccount newUser(username, password, clientSocket); // Create new user account with username, password and socket
+		newUser.registrationTime = GetCurrentTimestamp();
+		newUser.lastActivity = newUser.registrationTime;
 		registeredClients[username] = newUser; // Add to registered clients map
+
 		//Log the successful registration
 		LogMessage("User registered successfully - Username: " + username + ", Socket: " + std::to_string(clientSocket));
+		
 		//Create masked password for Display (showing only first and last character with X's in between)
 		std::string maskedPassword = CreateMaskedPassword(password);
 		std::string successMessage = "User '" + username + " (Password: " + maskedPassword + ")""' registered successfully! You can now login with your credentials.";
 		result = SendFramedMessage(clientSocket, successMessage);
+		
 		//Broadcast registration message to all connected clients
 		std::string broadcastMessage = "New user registered: " + username +" Make sure to reach out and say Hello";
 		BroadcastToAllClients(broadcastMessage ,clientSocket);
+		
 		//Also Log the broadcast for server admin visibility
 		LogMessage("Broadcasted registration message to all clients: " + broadcastMessage);
 	}
 	return result;
 }
+
+int Server::HandleLoginCommand(SOCKET clientSocket, const std::string& username, const std::string& password)
+{
+	std::cout << "[AUTH-PIPELINE] Processing login request for user: " << username
+		<< " [Socket:" << clientSocket << "]" << std::endl;
+
+	// Validation Pipeline - Using ternary operations for clean control flow
+	bool isAlreadyAuthenticated = IsUserAuthenticated(clientSocket);
+	bool userExists = IsUserRegistered(username);
+	bool userCurrentlyLoggedIn = userExists ? IsUserLoggedIn(username) : false;
+
+	std::cout << "[AUTH-CHECK] User exists: " << (userExists ? "YES" : "NO")
+		<< " | Already authenticated: " << (isAlreadyAuthenticated ? "YES" : "NO")
+		<< " | Currently logged in elsewhere: " << (userCurrentlyLoggedIn ? "YES" : "NO") << std::endl;
+
+	// Error handling with switch-case for clean control flow
+	enum AuthErrorType {
+		AUTH_SUCCESS = 0,
+		ALREADY_AUTHENTICATED,
+		USER_NOT_FOUND,
+		DUPLICATE_SESSION,
+		INVALID_PASSWORD,
+		MAX_ATTEMPTS_EXCEEDED
+	};
+
+	AuthErrorType errorType = AUTH_SUCCESS;
+
+	// Determine error type using logical flow
+	if (isAlreadyAuthenticated) {
+		errorType = ALREADY_AUTHENTICATED;
+	}
+	else if (!userExists) {
+		errorType = USER_NOT_FOUND;
+	}
+	else if (userCurrentlyLoggedIn) {
+		errorType = DUPLICATE_SESSION;
+	}
+	else if (registeredClients[username].password != password) {
+		registeredClients[username].loginAttempts++;
+		errorType = (registeredClients[username].loginAttempts >= MAX_LOGIN_ATTEMPTS)
+			? MAX_ATTEMPTS_EXCEEDED : INVALID_PASSWORD;
+	}
+
+	// Switch-based error handling for clean control flow
+	switch (errorType) {
+	case ALREADY_AUTHENTICATED:
+		std::cout << "[AUTH-ERROR] Redundant login attempt detected - Client already authenticated" << std::endl;
+		return SendFramedMessage(clientSocket,
+			"ERROR: You are already logged in. Logout first to login with a different account.");
+
+	case USER_NOT_FOUND:
+		std::cout << "[AUTH-ERROR] Login attempt for non-existent user: " << username << std::endl;
+		return SendFramedMessage(clientSocket,
+			"ERROR: User '" + username + "' not found. Please register first.");
+
+	case DUPLICATE_SESSION:
+		std::cout << "[AUTH-ERROR] Duplicate session attempt for user: " << username << std::endl;
+		return SendFramedMessage(clientSocket,
+			"ERROR: User '" + username + "' is already logged in from another session.");
+
+	case INVALID_PASSWORD:
+		std::cout << "[AUTH-ERROR] Invalid password for user: " << username
+			<< " (Attempt #" << registeredClients[username].loginAttempts << ")" << std::endl;
+		return SendFramedMessage(clientSocket,
+			"ERROR: Invalid password for user '" + username + "'.");
+
+	case MAX_ATTEMPTS_EXCEEDED:
+		std::cout << "[AUTH-WARNING] Maximum login attempts exceeded for user: " << username
+			<< " - Account temporarily locked" << std::endl;
+		return SendFramedMessage(clientSocket,
+			"ERROR: Maximum login attempts exceeded. Account temporarily locked.");
+
+	case AUTH_SUCCESS:
+	default:
+		break; // Continue to success logic
+	}
+
+	// Success path - Update all relevant data structures atomically
+	std::cout << "[AUTH-SUCCESS] Authenticating user: " << username << std::endl;
+
+	// Atomic state updates to prevent inconsistency
+	UserAccount& user = registeredClients[username];
+	user.isLoggedIn = true;
+	user.isOnline = true;
+	user.clientSocket = clientSocket;
+	user.loginAttempts = 0; // Reset failed attempts
+	user.lastActivity = GetCurrentTimestamp();
+
+	// Update session tracking
+	activeClients[clientSocket] = username;
+	clientSessions[clientSocket].isAuthenticated = true;
+	clientSessions[clientSocket].username = username;
+
+	std::cout << "[AUTH-COMPLETE] User successfully authenticated and session established" << std::endl;
+
+	// Send success message and broadcast login
+	std::string successMessage = "Login successful. Welcome " + username + "!";
+	int result = SendFramedMessage(clientSocket, successMessage);
+
+	if (result == SUCCESS) {
+		std::string broadcastMessage = username + " has joined the chat.";
+		BroadcastToAllClients(broadcastMessage, clientSocket);
+		std::cout << "[BROADCAST] Login announcement sent to all clients" << std::endl;
+	}
+	else {
+		std::cout << "[ERROR] Failed to send success message - Error code: " << result << std::endl;
+	}
+
+	return result;
+
+}
+
+int Server::HandleLogoutCommand(SOCKET clientSocket)
+{
+	std::cout << "[LOGOUT-PIPELINE] Processing logout request [Socket:" << clientSocket << "]" << std::endl;
+
+	// Validation check with early return pattern
+	if (!IsUserAuthenticated(clientSocket)) {
+		std::cout << "[LOGOUT-ERROR] Logout attempt from unauthenticated client" << std::endl;
+		return SendFramedMessage(clientSocket, "ERROR: You are not logged in.");
+	}
+	std::string username = activeClients[clientSocket];
+	std::cout << "[LOGOUT-PROCESS] Logging out user: " << username << std::endl;
+
+	// Atomic cleanup operations to prevent data inconsistency
+	auto userIt = registeredClients.find(username);
+	if (userIt != registeredClients.end()) {
+		userIt->second.isLoggedIn = false;
+		userIt->second.isOnline = false;
+		userIt->second.clientSocket = INVALID_SOCKET;
+		std::cout << "[LOGOUT-CLEANUP] User account status updated" << std::endl;
+	}
+	else {
+		std::cout << "[LOGOUT-WARNING] User not found in registered clients during logout" << std::endl;
+	}
+	// Session cleanup
+	activeClients.erase(clientSocket);
+	auto sessionIt = clientSessions.find(clientSocket);
+	if (sessionIt != clientSessions.end()) {
+		sessionIt->second.isAuthenticated = false;
+		sessionIt->second.username.clear();
+		std::cout << "[LOGOUT-CLEANUP] Client session cleared" << std::endl;
+	}
+	// Send logout confirmation and broadcast
+	std::string logoutMessage = "Logout successful. Connection will be terminated.";
+	int result = SendFramedMessage(clientSocket, logoutMessage);
+
+	if (result == SUCCESS) {
+		std::string broadcastMessage = username + " has left the chat.";
+		BroadcastToAllClients(broadcastMessage, clientSocket);
+		std::cout << "[BROADCAST] Logout announcement sent to all clients" << std::endl;
+	}
+
+	std::cout << "[LOGOUT-COMPLETE] User successfully logged out, initiating connection termination" << std::endl;
+	return SHUTDOWN; // Signal for connection termination
+
+}
+
+int Server::HandleGetListCommand(SOCKET clientSocket)
+{
+	std::cout << "[GETLIST] Processing user list request [Socket:" << clientSocket << "]" << std::endl;
+
+	// Authentication check with early return
+	if (!IsUserAuthenticated(clientSocket)) {
+		std::cout << "[GETLIST-ERROR] Unauthenticated list access attempt" << std::endl;
+		return SendFramedMessage(clientSocket, "ERROR: You must be logged in to view the user list.");
+	}
+
+	std::ostringstream userList;
+	userList << "Active users (" << activeClients.size() << "):\n";
+
+	if (activeClients.empty()) {
+		userList << "No users currently online.\n";
+	}
+	else {
+		int count = 1;
+		for (const auto& pair : activeClients) {
+			userList << count << ". " << pair.second << "\n";
+			count++;
+		}
+	}
+
+	std::cout << "[GETLIST-SUCCESS] Sent list of " << activeClients.size() << " users" << std::endl;
+	return SendFramedMessage(clientSocket, userList.str());
+}
+
+int Server::HandleGetLogCommand(SOCKET clientSocket)
+{
+	std::cout << "[GETLOG-PIPELINE] Processing log retrieval request [Socket:" << clientSocket << "]" << std::endl;
+
+	// Authentication check with early return
+	if (!IsUserAuthenticated(clientSocket)) {
+		std::cout << "[GETLOG-ERROR] Unauthenticated log access attempt" << std::endl;
+		return SendFramedMessage(clientSocket, "ERROR: You must be logged in to view message logs.");
+	}
+
+	std::ifstream logFile(MESSAGES_LOG_FILE);
+	std::ostringstream logContent;
+
+	if (!logFile.is_open()) {
+		std::cout << "[GETLOG-INFO] Message log file not found or empty" << std::endl;
+		logContent << "Message log is empty or unavailable.\n";
+	}
+	else {
+		std::cout << "[GETLOG-PROCESS] Reading message log file" << std::endl;
+
+		logContent << "Public Message History:\n";
+		logContent << "======================\n";
+
+		std::string line;
+		int lineCount = 0;
+		const int MAX_LINES = 50; // Prevent memory issues with large logs
+
+		while (std::getline(logFile, line) && lineCount < MAX_LINES) {
+			logContent << line << "\n";
+			lineCount++;
+		}
+		logFile.close();
+
+		std::cout << "[GETLOG-INFO] Retrieved " << lineCount << " message lines (max: " << MAX_LINES << ")" << std::endl;
+
+		if (lineCount == 0) {
+			logContent << "No public messages found.\n";
+		}
+		else if (lineCount == MAX_LINES) {
+			logContent << "\n[Note: Showing last " << MAX_LINES << " messages only]\n";
+		}
+	}
+
+	int result = SendFramedMessage(clientSocket, logContent.str());
+	std::cout << "[GETLOG-COMPLETE] Log data sent to client [Result:" << result << "]" << std::endl;
+
+	return result;
+}
+
+int Server::HandleSendCommand(SOCKET clientSocket, const std::string& recipient, const std::string& message)
+{
+	std::cout << "[DIRECT-MSG] Processing private message to: " << recipient
+		<< " [Socket:" << clientSocket << "]" << std::endl;
+
+	// Authentication validation
+	if (!IsUserAuthenticated(clientSocket)) {
+		std::cout << "[DIRECT-MSG-ERROR] Unauthenticated private message attempt" << std::endl;
+		return SendFramedMessage(clientSocket, "ERROR: You must be logged in to send private messages.");
+	}
+
+	// Recipient validation using iterator for efficiency
+	bool recipientFound = false;
+	SOCKET recipientSocket = INVALID_SOCKET;
+
+	for (const auto& client : activeClients) {
+		if (client.second == recipient) {
+			recipientFound = true;
+			recipientSocket = client.first;
+			break;
+		}
+	}
+
+	if (!recipientFound) {
+		std::cout << "[DIRECT-MSG-ERROR] Recipient not found or offline: " << recipient << std::endl;
+		return SendFramedMessage(clientSocket, "ERROR: User '" + recipient + "' is not online.");
+	}
+
+	std::cout << "[DIRECT-MSG-PROCESS] Sending private message to authenticated recipient" << std::endl;
+	return SendDirectMessage(clientSocket, recipient, message);
+}
+
+int Server::SendDirectMessage(SOCKET senderSocket, const std::string& recipientUsername, const std::string& message)
+{
+	// Find recipient socket
+	SOCKET recipientSocket = INVALID_SOCKET;
+	for (const auto& pair : activeClients) {
+		if (pair.second == recipientUsername) {
+			recipientSocket = pair.first;
+			break;
+		}
+	}
+
+	if (recipientSocket == INVALID_SOCKET) {
+		return SendFramedMessage(senderSocket, "ERROR: Recipient unavailable.");
+	}
+
+	std::string senderName = activeClients[senderSocket];
+	std::string directMessage = "[PRIVATE] " + senderName + ": " + message;
+
+	int result = SendFramedMessage(recipientSocket, directMessage);
+	if (result == SUCCESS) {
+		SendFramedMessage(senderSocket, "Message sent to " + recipientUsername);
+		std::cout << "[SEND-SUCCESS] Private message delivered" << std::endl;
+	}
+
+	return result;
+}
+
 
 int Server::SendFramedMessage(SOCKET clientSocket, const std::string& message)
 {
@@ -613,14 +965,61 @@ int Server::RecieveFramedMessage(SOCKET clientSocket, char* buffer, int bufferSi
 	return result;
 }
 
+int Server::ProcessCommandMessage(SOCKET clientSocket, const std::string& message)
+{
+	std::cout << "[COMMAND-PROCESS] Logging and processing command" << std::endl;
+	LogCommand(clientSocket, message);
+	return ProcessCommand(clientSocket, message);
+}
+
+int Server::ProcessChatMessage(SOCKET clientSocket, const std::string& message)
+{
+	std::cout << "[CHAT-PROCESS] Processing chat message" << std::endl;
+
+	if (!IsUserAuthenticated(clientSocket)) {
+		std::cout << "[CHAT-ERROR] Unauthenticated chat attempt [Socket:" << clientSocket << "]" << std::endl;
+		return SendFramedMessage(clientSocket,
+			"ERROR: You must login to send messages. Type '" + std::string(1, commandChar) + "help' for instructions.");
+	}
+
+	std::string senderName = activeClients[clientSocket];
+	std::cout << "[CHAT-INFO] Message from authenticated user: " << senderName << std::endl;
+
+	// Log public message
+	LogPublicMessage(senderName, message);
+
+	// Broadcast to all authenticated clients
+	std::string broadcastMessage = senderName + ": " + message;
+	int result = BroadcastToAllClients(broadcastMessage, clientSocket);
+
+	std::cout << "[CHAT-COMPLETE] Message broadcast [Result:" << result << "]" << std::endl;
+	return result;
+}
+
 bool Server::IsUserRegistered(const std::string& username)
 {
+	//Check if the username exists in the registered clients map
 	return registeredClients.find(username)!=registeredClients.end();
 }
 
 bool Server::isSocketConnected(SOCKET clientSocket)
 {
+	//Check if the socket is valid and not closed
 	return clientSocket != INVALID_SOCKET;
+}
+
+bool Server::IsUserLoggedIn(const std::string& username)
+{
+	/// Check if the user is registered and logged in
+	auto it = registeredClients.find(username);
+	return (it != registeredClients.end() && it->second.isLoggedIn);
+}
+
+bool Server::IsUserAuthenticated(SOCKET clientSocket)
+{
+	//Check if the client socket is in the clientSessions map and if it is authenticated
+	auto it = clientSessions.find(clientSocket);
+	return (it != clientSessions.end() && it->second.isAuthenticated);
 }
 
 void Server::RemoveClient(SOCKET clientSocket)
@@ -656,6 +1055,62 @@ void Server::RemoveClient(SOCKET clientSocket)
 void Server::LogMessage(const std::string& message)
 {
 	std::cout << "[Server]" << message << std::endl;
+}
+
+void Server::LogCommand(SOCKET clientSocket, const std::string& command)
+{
+	std::cout << "[LOG-COMMAND] Recording command execution [Socket:" << clientSocket << "]" << std::endl;
+
+	std::ofstream logFile(COMMANDS_LOG_FILE, std::ios::app);
+	if (!logFile.is_open()) {
+		std::cout << "[LOG-ERROR] Failed to open commands log file: " << COMMANDS_LOG_FILE << std::endl;
+		return;
+	}
+
+	std::string timestamp = GetCurrentTimestamp();
+	std::string username = (activeClients.find(clientSocket) != activeClients.end())
+		? activeClients[clientSocket] : "Anonymous";
+
+	logFile << "[" << timestamp << "] " << username
+		<< " (Socket:" << clientSocket << "): " << command << std::endl;
+	logFile.close();
+
+	std::cout << "[LOG-SUCCESS] Command logged for user: " << username << std::endl;
+}
+
+void Server::LogPublicMessage(const std::string& senderName, const std::string& message)
+{
+	std::cout << "[LOG-MESSAGE] Recording public message from: " << senderName << std::endl;
+
+	std::ofstream logFile(MESSAGES_LOG_FILE, std::ios::app); // Open in append mode for logging messages
+	if (!logFile.is_open()) {
+		std::cout << "[LOG-ERROR] Failed to open messages log file: " << MESSAGES_LOG_FILE << std::endl;
+		return;
+	}
+
+	std::string timestamp = GetCurrentTimestamp();
+	logFile << "[" << timestamp << "] " << senderName << ": " << message << std::endl;
+	logFile.close();
+
+	std::cout << "[LOG-SUCCESS] Public message logged" << std::endl;
+}
+
+std::string Server::GetCurrentTimestamp()
+{
+	auto now = std::time(nullptr);
+	std::tm localTime = {};
+
+#ifdef _WIN32
+	// Use secure version on Windows
+	localtime_s(&localTime, &now);
+#else
+	// Use standard version on other platforms
+	localTime = *std::localtime(&now);
+#endif
+
+	std::ostringstream oss;
+	oss << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S");
+	return oss.str();
 }
 
 std::string Server::GetServerIPAddress()
